@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gddisney/ultimate_db"
-	"github.com/gddisney/webauthnext"
+	"github.com/0TrustCloud/ultimate_db"
+	"github.com/0TrustCloud/webauthnext"
 	"github.com/google/go-tpm/legacy/tpm2"
 )
 
