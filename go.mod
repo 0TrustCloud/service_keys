@@ -1,4 +1,4 @@
-module github.com/gddisney/service_keys
+module github.com/0TrustCloud/service_keys
 
 go 1.25.10
 
