@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/0TrustCloud/logger"
+	"github.com/0TrustCloud/secure_data_format"
 	"github.com/0TrustCloud/ultimate_db"
 	"github.com/0TrustCloud/webauthnext"
 	"github.com/google/go-tpm/legacy/tpm2"
@@ -19,35 +20,35 @@ import (
 
 // ServiceKeyManager handles TPM-backed machine identities and hardware attestations.
 type ServiceKeyManager struct {
-	Provider *webauthnext.Provider
-	DB       *ultimate_db.DB
-	Logger   *logger.LogDispatcher
+	Provider  *webauthnext.Provider
+	SdfEngine *secure_data_format.SecureDataEngine
+	Logger    *logger.LogDispatcher
 }
 
 // NewServiceKeyManager creates an active service identity coordinator instance.
 func NewServiceKeyManager(
-	db *ultimate_db.DB,
+	sdf *secure_data_format.SecureDataEngine,
 	provider *webauthnext.Provider,
 	sysLog *logger.LogDispatcher,
 ) *ServiceKeyManager {
 	return &ServiceKeyManager{
-		Provider: provider,
-		DB:       db,
-		Logger:   sysLog,
+		Provider:  provider,
+		SdfEngine: sdf,
+		Logger:    sysLog,
 	}
 }
 
 // LoadOrCreateManager validates context properties and instantiates the manager cleanly.
 func LoadOrCreateManager(
-	db *ultimate_db.DB,
+	sdf *secure_data_format.SecureDataEngine,
 	sysLog *logger.LogDispatcher,
 ) (*ServiceKeyManager, error) {
-	if db == nil {
-		return nil, fmt.Errorf("cannot instantiate identity management infrastructure without an active storage engine reference")
+	if sdf == nil {
+		return nil, fmt.Errorf("cannot instantiate identity management infrastructure without an active SDF engine reference")
 	}
 	return &ServiceKeyManager{
-		DB:     db,
-		Logger: sysLog,
+		SdfEngine: sdf,
+		Logger:    sysLog,
 	}, nil
 }
 
@@ -75,31 +76,51 @@ func (s *ServiceKeyManager) RegisterServiceIdentity(
 		return err
 	}
 
-	compositeKey := "user:" + name
+	targetAddress := "device:identity:" + name
+	script := `device:hardware(status("registered"))`
 
-	// 1. Transactional Write Path to MVCC/OCC Fast Cache Tier
+	// Compile transaction envelope via the cryptographic state engine
+	tx := secure_data_format.DataInvocation{
+		TargetAddress: targetAddress,
+		Caller:        "service-key-provisioner",
+		Nonce:         0, // Initial registration sequence
+		Method:        "REGISTER",
+		Profile:       secure_data_format.ProfileProofOfPoss,
+		Args: map[string]interface{}{
+			"service_name": name,
+			"status":       "active",
+		},
+	}
+
+	_, err = s.SdfEngine.CompileSecureData(script, tx)
+	if err != nil {
+		return fmt.Errorf("failed compiling hardware registration token: %w", err)
+	}
+
+	// Persist the schema-specific identity mapping block into the decoupled data domain slot
+	dataKey := "data:user:" + name
 	txID := ultimate_db.GlobalCacheStore.BeginOCC()
-	writeSet := map[string][]byte{
-		compositeKey: val,
-	}
-	if err := ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, writeSet, 0); err != nil {
-		return fmt.Errorf("failed to register machine asset structure into MVCC memory space: %w", err)
+	_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{dataKey: val}, 0)
+
+	txn := s.SdfEngine.Store.Begin()
+	if err := s.SdfEngine.Store.Put(txn, []byte(dataKey), val, 0); err != nil {
+		txn.Abort()
+		return fmt.Errorf("failed committing hardware profile map to durable storage: %w", err)
 	}
 
-	// 2. Transactional Write Path to Slotted Storage Subsystem for Persistence
-	txn := s.DB.BeginTxn()
-	err = s.DB.Write(webauthnext.AuthPageID, txn, []byte(compositeKey), val, 0)
-	s.DB.CommitTxn(txn)
+	if err := txn.Commit(); err != nil {
+		return err
+	}
 
-	if err == nil && s.Logger != nil {
+	if s.Logger != nil {
 		s.Logger.Audit(
 			"system",
 			"TPM_REGISTERED",
-			"Registered new hardware-backed service identity: "+name,
+			"Registered new hardware-backed service identity via SDF: "+name,
 		)
 	}
 
-	return err
+	return nil
 }
 
 // VerifySignature validates an inbound payload signature against the cryptographic key material stored inside the hardware layout.
@@ -108,26 +129,25 @@ func (s *ServiceKeyManager) VerifySignature(
 	payload []byte,
 	signature []byte,
 ) bool {
-	if s.DB == nil {
+	if s.SdfEngine == nil {
 		return false
 	}
 
-	compositeKey := "user:" + serviceID
+	dataKey := "data:user:" + serviceID
 	txID := ultimate_db.GlobalCacheStore.BeginOCC()
 
-	// Optimistic Read Verification Loop: Attempt cache lookup first to clear hot network loops instantly
-	userBytes, err := ultimate_db.GlobalCacheStore.Read(txID, compositeKey)
+	// Optimistic Read Verification Loop: Attempt lock-free cache lookup first
+	userBytes, err := ultimate_db.GlobalCacheStore.Read(txID, dataKey)
 	if err != nil {
-		// Fall back to slotted engine transaction blocks on cache miss
-		txn := s.DB.BeginTxn()
-		userBytes, err = s.DB.Read(webauthnext.AuthPageID, txn, []byte(compositeKey))
-		s.DB.CommitTxn(txn)
+		txn := s.SdfEngine.Store.Begin()
+		userBytes, err = s.SdfEngine.Store.Get(txn, []byte(dataKey))
+		txn.Commit()
 
 		if err != nil || len(userBytes) == 0 {
 			return false
 		}
-		// Populate cache asynchronously to accelerate subsequent authentication handshakes
-		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: userBytes}, 0)
+		// Repopulate cache frame to accelerate subsequent validations
+		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{dataKey: userBytes}, 0)
 	}
 
 	var user webauthnext.PasskeyUser
@@ -182,15 +202,15 @@ func (s *ServiceKeyManager) VerifyServiceSession(
 		nonce := parts[1]
 		sigBase64 := parts[2]
 
-		compositeKey := "user:" + serviceName
+		dataKey := "data:user:" + serviceName
 		txID := ultimate_db.GlobalCacheStore.BeginOCC()
 
-		// Route session verification through our high-speed lock-free cache window
-		userBytes, err := ultimate_db.GlobalCacheStore.Read(txID, compositeKey)
+		// Route session verification through high-speed cache window
+		userBytes, err := ultimate_db.GlobalCacheStore.Read(txID, dataKey)
 		if err != nil {
-			txn := s.DB.BeginTxn()
-			userBytes, err = s.DB.Read(webauthnext.AuthPageID, txn, []byte(compositeKey))
-			s.DB.CommitTxn(txn)
+			txn := s.SdfEngine.Store.Begin()
+			userBytes, err = s.SdfEngine.Store.Get(txn, []byte(dataKey))
+			txn.Commit()
 
 			if err != nil || len(userBytes) == 0 {
 				if s.Logger != nil {
@@ -199,7 +219,7 @@ func (s *ServiceKeyManager) VerifyServiceSession(
 				http.Error(w, "Service identity not found", http.StatusUnauthorized)
 				return
 			}
-			_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{compositeKey: userBytes}, 0)
+			_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{dataKey: userBytes}, 0)
 		}
 
 		var user webauthnext.PasskeyUser
