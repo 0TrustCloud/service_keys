@@ -14,7 +14,7 @@ import (
 	"github.com/0TrustCloud/logger"
 	"github.com/0TrustCloud/secure_data_format"
 	"github.com/0TrustCloud/ultimate_db"
-	"github.com/0TrustCloud/auth_provider"
+	webauthnext "github.com/0TrustCloud/auth_provider"
 	"github.com/google/go-tpm/legacy/tpm2"
 )
 
