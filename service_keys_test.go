@@ -87,19 +87,7 @@ func (m *mockLockManager) ReleaseAll(txnID uint64) error {
 
 // makeTPM2BPublic converts a test RSA key into standard TPM serialized public key bytes
 func makeTPM2BPublic(priv *rsa.PrivateKey) ([]byte, error) {
-	pub := tpm2.Public{
-		Type:       tpm2.AlgRSA,
-		NameAlg:    tpm2.AlgSHA256,
-		Attributes: tpm2.FlagFixedTPM | tpm2.FlagFixedParent | tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth | tpm2.FlagSign,
-		Parameters: &tpm2.RSAParams{
-			Symmetric: &tpm2.SymDef{Algorithm: tpm2.AlgNull},
-			KeyBits:   2048,
-		},
-		Unique: &tpm2.RSAUnique{
-			Buffer: priv.PublicKey.N.Bytes(),
-		},
-	}
-	return pub.Encode()
+	return EncodeTPM2BPublic(&priv.PublicKey)
 }
 
 func setupTestEnvironment(t *testing.T) (*ServiceKeyManager, *rsa.PrivateKey) {

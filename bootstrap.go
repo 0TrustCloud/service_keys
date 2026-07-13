@@ -120,6 +120,7 @@ func (s *ServiceKeyManager) RegisterServiceIdentity(
 		)
 	}
 
+	_ = s.addToIndex(name)
 	return nil
 }
 
@@ -173,6 +174,133 @@ func (s *ServiceKeyManager) VerifySignature(
 	hash := sha256.Sum256(payload)
 	err = rsa.VerifyPKCS1v15(rsaPubKey, crypto.SHA256, hash[:], signature)
 	return err == nil
+}
+
+// EncodeTPM2BPublic serializes an RSA public key into TPM2B_PUBLIC bytes.
+func EncodeTPM2BPublic(key *rsa.PublicKey) ([]byte, error) {
+	pub := tpm2.Public{
+		Type:       tpm2.AlgRSA,
+		NameAlg:    tpm2.AlgSHA256,
+		Attributes: tpm2.FlagFixedTPM | tpm2.FlagFixedParent | tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth | tpm2.FlagSign,
+		RSAParameters: &tpm2.RSAParams{
+			Sign: &tpm2.SigScheme{
+				Alg:  tpm2.AlgRSASSA,
+				Hash: tpm2.AlgSHA256,
+			},
+			KeyBits:    2048,
+			ModulusRaw: key.N.Bytes(),
+		},
+	}
+	return pub.Encode()
+}
+
+// ServiceIdentity describes a registered machine identity.
+type ServiceIdentity struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Registered  bool   `json:"registered"`
+}
+
+// ListServiceIdentities returns all registered TPM-backed service names.
+func (s *ServiceKeyManager) ListServiceIdentities() ([]ServiceIdentity, error) {
+	if s.SdfEngine == nil || s.SdfEngine.Store == nil {
+		return nil, fmt.Errorf("storage unavailable")
+	}
+	indexKey := []byte("data:servicekeys:index")
+	txn := s.SdfEngine.Store.Begin()
+	indexBytes, err := s.SdfEngine.Store.Get(txn, indexKey)
+	txn.Commit()
+	if err != nil || len(indexBytes) == 0 {
+		return []ServiceIdentity{}, nil
+	}
+	var names []string
+	if err := json.Unmarshal(indexBytes, &names); err != nil {
+		return nil, err
+	}
+	out := make([]ServiceIdentity, 0, len(names))
+	for _, name := range names {
+		dataKey := "data:user:" + name
+		txID := ultimate_db.GlobalCacheStore.BeginOCC()
+		userBytes, err := ultimate_db.GlobalCacheStore.Read(txID, dataKey)
+		if err != nil {
+			txn := s.SdfEngine.Store.Begin()
+			userBytes, err = s.SdfEngine.Store.Get(txn, []byte(dataKey))
+			txn.Commit()
+		}
+		entry := ServiceIdentity{Name: name, Registered: err == nil && len(userBytes) > 0}
+		if entry.Registered {
+			var user webauthnext.PasskeyUser
+			if json.Unmarshal(userBytes, &user) == nil {
+				entry.DisplayName = user.DisplayName
+			}
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+func (s *ServiceKeyManager) addToIndex(name string) error {
+	names, _ := s.ListServiceIdentities()
+	seen := false
+	for _, existing := range names {
+		if existing.Name == name {
+			seen = true
+			break
+		}
+	}
+	var index []string
+	for _, existing := range names {
+		index = append(index, existing.Name)
+	}
+	if !seen {
+		index = append(index, name)
+	}
+	indexBytes, err := json.Marshal(index)
+	if err != nil {
+		return err
+	}
+	txn := s.SdfEngine.Store.Begin()
+	if err := s.SdfEngine.Store.Put(txn, []byte("data:servicekeys:index"), indexBytes, 0); err != nil {
+		txn.Abort()
+		return err
+	}
+	return txn.Commit()
+}
+
+// DeleteServiceIdentity removes a registered machine identity.
+func (s *ServiceKeyManager) DeleteServiceIdentity(name string) error {
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	dataKey := []byte("data:user:" + name)
+	txn := s.SdfEngine.Store.Begin()
+	if err := s.SdfEngine.Store.Delete(txn, dataKey); err != nil {
+		txn.Abort()
+		return err
+	}
+	if err := txn.Commit(); err != nil {
+		return err
+	}
+	names, _ := s.ListServiceIdentities()
+	var remaining []string
+	for _, existing := range names {
+		if existing.Name != name {
+			remaining = append(remaining, existing.Name)
+		}
+	}
+	indexBytes, _ := json.Marshal(remaining)
+	txn = s.SdfEngine.Store.Begin()
+	if err := s.SdfEngine.Store.Put(txn, []byte("data:servicekeys:index"), indexBytes, 0); err != nil {
+		txn.Abort()
+		return err
+	}
+	if err := txn.Commit(); err != nil {
+		return err
+	}
+	if s.Logger != nil {
+		s.Logger.Audit("system", "TPM_REVOKED", "Revoked hardware-backed service identity: "+name)
+	}
+	return nil
 }
 
 // VerifyServiceSession acts as a high-performance HTTP network guardian enforcing continuous DBSC cryptographic proofs.
